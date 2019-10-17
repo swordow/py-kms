@@ -24,8 +24,6 @@
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """Tools to convert between Python datetime instances and Microsoft times.
 """
-from datetime import datetime, timedelta, tzinfo
-from calendar import timegm
 
 
 # http://support.microsoft.com/kb/167296
@@ -34,67 +32,38 @@ EPOCH_AS_FILETIME = 116444736000000000  # January 1, 1970 as MS file time
 HUNDREDS_OF_NANOSECONDS = 10000000
 
 
-ZERO = timedelta(0)
-HOUR = timedelta(hours=1)
-
-
-class UTC(tzinfo):
-	"""UTC"""
-	def utcoffset(self, dt):
-		return ZERO
-
-	def tzname(self, dt):
-		return "UTC"
-
-	def dst(self, dt):
-		return ZERO
-
-
-utc = UTC()
-
-
-def dt_to_filetime(dt):
+def timestamp2filetime(ts):
 	"""Converts a datetime to Microsoft filetime format. If the object is
 	time zone-naive, it is forced to UTC before conversion.
 
-	>>> "%.0f" % dt_to_filetime(datetime(2009, 7, 25, 23, 0))
+	>>> import calendar
+	>>> "%.0f" % timestamp2filetime(calendar.timegm((2009, 7, 25, 23, 0, 0, 0, 0, 0)))
 	'128930364000000000'
 
-	>>> "%.0f" % dt_to_filetime(datetime(1970, 1, 1, 0, 0, tzinfo=utc))
+	>>> "%.0f" % timestamp2filetime(calendar.timegm((1970, 1, 1, 0, 0, 0, 0, 0)))
 	'116444736000000000'
 
-	>>> "%.0f" % dt_to_filetime(datetime(1970, 1, 1, 0, 0))
-	'116444736000000000'
-	
-	>>> dt_to_filetime(datetime(2009, 7, 25, 23, 0, 0, 100))
-	128930364000001000
+	>>> timestamp2filetime(calendar.timegm((2009, 7, 25, 23, 0, 0, 0, 0, 0)) + 0.001)
+	128930364000010000
 	"""
-	if (dt.tzinfo is None) or (dt.tzinfo.utcoffset(dt) is None):
-		dt = dt.replace(tzinfo=utc)
-	ft = EPOCH_AS_FILETIME + (timegm(dt.timetuple()) * HUNDREDS_OF_NANOSECONDS)
-	return ft + (dt.microsecond * 10)
+	return int(ts * HUNDREDS_OF_NANOSECONDS) + EPOCH_AS_FILETIME
 
 
-def filetime_to_dt(ft):
+def filetime2timestamp(ft):
 	"""Converts a Microsoft filetime number to a Python datetime. The new
 	datetime object is time zone-naive but is equivalent to tzinfo=utc.
 
-	>>> filetime_to_dt(116444736000000000)
-	datetime.datetime(1970, 1, 1, 0, 0)
+	>>> filetime2timestamp(116444736000000000)
+	0.0
 
-	>>> filetime_to_dt(128930364000000000)
-	datetime.datetime(2009, 7, 25, 23, 0)
+	>>> filetime2timestamp(128930364000000000)
+	1248562800.0
 	
-	>>> filetime_to_dt(128930364000001000)
-	datetime.datetime(2009, 7, 25, 23, 0, 0, 100)
+	>>> filetime2timestamp(128930364000001000)
+	1248562800.0001
 	"""
 	# Get seconds and remainder in terms of Unix epoch
-	(s, ns100) = divmod(ft - EPOCH_AS_FILETIME, HUNDREDS_OF_NANOSECONDS)
-	# Convert to datetime object
-	dt = datetime.utcfromtimestamp(s)
-	# Add remainder in as microseconds. Python 3.2 requires an integer
-	dt = dt.replace(microsecond=(ns100 // 10))
-	return dt
+	return (ft - EPOCH_AS_FILETIME) / float(HUNDREDS_OF_NANOSECONDS)
 
 
 if __name__ == "__main__":

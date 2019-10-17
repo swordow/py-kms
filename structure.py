@@ -6,8 +6,13 @@
 #
 # $Id$
 #
+from __future__ import print_function
+try:
+	from struct import pack, unpack, calcsize
+except ImportError:
+	from ustruct import pack, unpack, calcsize
 
-from struct import pack, unpack, calcsize
+debug = 0
 
 class Structure:
 	""" sublcasses can define commonHdr and/or structure.
@@ -72,82 +77,69 @@ class Structure:
 	"""
 	commonHdr = ()
 	structure = ()
-	debug = 0
 
 	def __init__(self, data = None, alignment = 0):
 		if not hasattr(self, 'alignment'):
 			self.alignment = alignment
 
 		self.fields    = {}
-		self.rawData   = data
 		if data is not None:
 			self.fromString(data)
 		else:
 			self.data = None
 
-	@classmethod
-	def fromFile(self, file):
-		answer = self()
-		answer.fromString(file.read(len(answer)))
-		return answer
-
-	def setAlignment(self, alignment):
-		self.alignment = alignment
-
-	def setData(self, data):
-		self.data = data
-
 	def packField(self, fieldName, format = None):
-		if self.debug:
-			print "packField( %s | %s )" % (fieldName, format)
+		if debug:
+			print("packField( %s | %s )" % (fieldName, format))
 
 		if format is None:
 			format = self.formatForField(fieldName)
 
-		if self.fields.has_key(fieldName):
+		if fieldName in self.fields:
 			ans = self.pack(format, self.fields[fieldName], field = fieldName)
 		else:
 			ans = self.pack(format, None, field = fieldName)
 
-		if self.debug:
-			print "\tanswer %r" % ans
+		if debug:
+			print("\tanswer %r" % ans)
 
 		return ans
 
 	def getData(self):
 		if self.data is not None:
 			return self.data
-		data = ''
+		data = b''
 		for field in self.commonHdr+self.structure:
 			try:
 				data += self.packField(field[0], field[1])
-			except Exception, e:
-				if self.fields.has_key(field[0]):
-					e.args += ("When packing field '%s | %s | %r' in %s" % (field[0], field[1], self[field[0]], self.__class__),)
+			except Exception:
+				import sys
+
+				if field[0] in self.fields:
+					print("When packing field '%s | %s | %r' in %s" % (field[0], field[1], self[field[0]], self.__class__), file=sys.stderr)
 				else:
-					e.args += ("When packing field '%s | %s' in %s" % (field[0], field[1], self.__class__),)
+					print("When packing field '%s | %s' in %s" % (field[0], field[1], self.__class__), file=sys.stderr)
 				raise
 			if self.alignment:
 				if len(data) % self.alignment:
-					data += ('\x00'*self.alignment)[:-(len(data) % self.alignment)]
+					data += (b'\x00'*self.alignment)[:-(len(data) % self.alignment)]
 			
 		#if len(data) % self.alignment: data += ('\x00'*self.alignment)[:-(len(data) % self.alignment)]
 		return data
 
 	def fromString(self, data):
-		self.rawData = data
 		for field in self.commonHdr+self.structure:
-			if self.debug:
-				print "fromString( %s | %s | %r )" % (field[0], field[1], data)
+			if debug:
+				print("fromString( %s | %s | %r )" % (field[0], field[1], data))
 			size = self.calcUnpackSize(field[1], data, field[0])
-			if self.debug:
-				print "  size = %d" % size
-			dataClassOrCode = str
+			if debug:
+				print("  size = %d" % size)
+			dataClassOrCode = bytes
 			if len(field) > 2:
 				dataClassOrCode = field[2]
 			try:
 				self[field[0]] = self.unpack(field[1], data[:size], dataClassOrCode = dataClassOrCode, field = field[0])
-			except Exception,e:
+			except Exception as e:
 				e.args += ("When unpacking field '%s | %s | %r[:%d]'" % (field[0], field[1], data, size),)
 				raise
 
@@ -156,6 +148,8 @@ class Structure:
 				size += self.alignment - (size % self.alignment)
 			data = data[size:]
 
+		if debug:
+			self.dump(indent=4)
 		return self
 		
 	def __setitem__(self, key, value):
@@ -168,69 +162,84 @@ class Structure:
 	def __delitem__(self, key):
 		del self.fields[key]
 		
-	def __str__(self):
+	def __bytes__(self):
+		if debug:
+			self.dump(indent=4)
 		return self.getData()
+
+	def __str__(self):
+		"""
+		In python 2, func `bytes` is alias of `str` and redirect to `__str__`,
+		workaround here is to redirect back to `__bytes__`
+		"""
+		if str is bytes:
+			return self.__bytes__()
+		else:
+			return super(Structure, self).__str__()
 
 	def __len__(self):
 		# XXX: improve
 		return len(self.getData())
 
 	def pack(self, format, data, field = None):
-		if self.debug:
-			print "  pack( %s | %r | %s)" %  (format, data, field)
+		if debug:
+			print("  pack( %s | %r | %s)" %  (format, data, field))
 
 		if field:
 			addressField = self.findAddressFieldFor(field)
 			if (addressField is not None) and (data is None):
-				return ''
+				return b''
 
 		# void specifier
 		if format[:1] == '_':
-			return ''
+			return b''
 
 		# quote specifier
 		if format[:1] == "'" or format[:1] == '"':
-			return format[1:]
+			return format[1:].encode()
 
 		# code specifier
 		two = format.split('=')
 		if len(two) >= 2:
-			try:
+			if data:
 				return self.pack(two[0], data)
-			except:
+			else:
 				fields = {'self':self}
 				fields.update(self.fields)
-				return self.pack(two[0], eval(two[1], {}, fields))
+				self[field] = eval(two[1], {}, fields)
+				return self.pack(two[0], self[field])
 
 		# address specifier
 		two = format.split('&')
 		if len(two) == 2:
-			try:
+			if data:
 				return self.pack(two[0], data)
-			except:
-				if (self.fields.has_key(two[1])) and (self[two[1]] is not None):
-					return self.pack(two[0], id(self[two[1]]) & ((1<<(calcsize(two[0])*8))-1) )
+			else:
+				if (two[1] in self.fields) and (self[two[1]] is not None):
+					self[field] = id(self[two[1]]) & ((1<<(calcsize(two[0])*8))-1)
 				else:
-					return self.pack(two[0], 0)
+					self[field] = 0
+				return self.pack(two[0], self[field])
 
 		# length specifier
 		two = format.split('-')
 		if len(two) == 2:
-			try:
+			if data:
 				return self.pack(two[0],data)
-			except:
-				return self.pack(two[0], self.calcPackFieldSize(two[1]))
+			else:
+				self[field] = self.calcPackFieldSize(two[1])
+				return self.pack(two[0], self[field])
 
 		# array specifier
 		two = format.split('*')
 		if len(two) == 2:
-			answer = ''
+			answer = b''
 			for each in data:
 				answer += self.pack(two[1], each)
 			if two[0]:
 				if two[0].isdigit():
 					if int(two[0]) != len(data):
-						raise Exception, "Array field has a constant size, and it doesn't match the actual value"
+						raise Exception("Array field has a constant size, and it doesn't match the actual value")
 				else:
 					return self.pack(two[0], len(data))+answer
 			return answer
@@ -242,34 +251,37 @@ class Structure:
 
 		# asciiz specifier
 		if format[:1] == 'z':
-			return str(data)+'\0'
+			return data+b'\0'
 
 		# unicode specifier
 		if format[:1] == 'u':
-			return str(data)+'\0\0' + (len(data) & 1 and '\0' or '')
+			return data+b'\0\0' + (len(data) & 1 and b'\0' or b'')
 
 		# DCE-RPC/NDR string specifier
 		if format[:1] == 'w':
 			if len(data) == 0:
-				data = '\0\0'
+				data = b'\0\0'
 			elif len(data) % 2:
-				data += '\0'
-			l = pack('<L', len(data)/2)
-			return '%s\0\0\0\0%s%s' % (l,l,data)
+				data = data.encode() + b'\0'
+			l = pack('<L', len(data)//2)
+			return b''.join(map(bytes,[l, b'\0\0\0\0', l, data]))
 					
 		if data is None:
-			raise Exception, "Trying to pack None"
+			raise Exception("Trying to pack None")
 		
 		# literal specifier
 		if format[:1] == ':':
-			return str(data)
+			try:
+				return data.__bytes__()
+			except AttributeError:
+				return bytes(data)
 
 		# struct like specifier
 		return pack(format, data)
 
-	def unpack(self, format, data, dataClassOrCode = str, field = None):
-		if self.debug:
-			print "  unpack( %s | %r )" %  (format, data)
+	def unpack(self, format, data, dataClassOrCode = bytes, field = None):
+		if debug:
+			print("  unpack( %s | %r )" %  (format, data))
 
 		if field:
 			addressField = self.findAddressFieldFor(field)
@@ -279,7 +291,7 @@ class Structure:
 
 		# void specifier
 		if format[:1] == '_':
-			if dataClassOrCode != str:
+			if dataClassOrCode != bytes:
 				fields = {'self':self, 'inputDataLeft':data}
 				fields.update(self.fields)
 				return eval(dataClassOrCode, {}, fields)
@@ -289,8 +301,8 @@ class Structure:
 		# quote specifier
 		if format[:1] == "'" or format[:1] == '"':
 			answer = format[1:]
-			if answer != data:
-				raise Exception, "Unpacked data doesn't match constant value '%r' should be '%r'" % (data, answer)
+			if answer != data.decode():
+				raise Exception("Unpacked data doesn't match constant value '%r' should be '%r'" % (data, answer))
 			return answer
 
 		# address specifier
@@ -335,14 +347,14 @@ class Structure:
 
 		# asciiz specifier
 		if format == 'z':
-			if data[-1] != '\x00':
-				raise Exception, ("%s 'z' field is not NUL terminated: %r" % (field, data))
+			if data[-1:] != b'\x00':
+				raise Exception("%s 'z' field is not NUL terminated: %r" % (field, data))
 			return data[:-1] # remove trailing NUL
 
 		# unicode specifier
 		if format == 'u':
-			if data[-2:] != '\x00\x00':
-				raise Exception, ("%s 'u' field is not NUL-NUL terminated: %r" % (field, data))
+			if data[-2:] != b'\x00\x00':
+				raise Exception("%s 'u' field is not NUL-NUL terminated: %r" % (field, data))
 			return data[:-2] # remove trailing NUL
 
 		# DCE-RPC/NDR string specifier
@@ -394,7 +406,7 @@ class Structure:
 			answer = 0
 			if two[0].isdigit():
 					if int(two[0]) != len(data):
-						raise Exception, "Array field has a constant size, and it doesn't match the actual value"
+						raise Exception("Array field has a constant size, and it doesn't match the actual value")
 			elif two[0]:
 				answer += self.calcPackSize(two[0], len(data))
 
@@ -429,8 +441,8 @@ class Structure:
 		return calcsize(format)
 
 	def calcUnpackSize(self, format, data, field = None):
-		if self.debug:
-			print "  calcUnpackSize( %s | %s | %r)" %  (field, format, data)
+		if debug:
+			print("  calcUnpackSize( %s | %s | %r)" %  (field, format, data))
 
 		# void specifier
 		if format[:1] == '_':
@@ -489,15 +501,15 @@ class Structure:
 
 		# "printf" string specifier
 		if format[:1] == '%':
-			raise Exception, "Can't guess the size of a printf like specifier for unpacking"
+			raise Exception("Can't guess the size of a printf like specifier for unpacking")
 
 		# asciiz specifier
 		if format[:1] == 'z':
-			return data.index('\x00')+1
+			return data.index(b'\x00')+1
 
 		# asciiz specifier
 		if format[:1] == 'u':
-			l = data.index('\x00\x00')
+			l = data.index(b'\x00\x00')
 			return l + (l & 1 and 3 or 2)
 
 		# DCE-RPC/NDR string specifier
@@ -522,7 +534,7 @@ class Structure:
 		for field in self.commonHdr+self.structure:
 			if field[0] == fieldName:
 				return field[1]
-		raise Exception, ("Field %s not found" % fieldName)
+		raise Exception("Field %s not found" % fieldName)
 
 	def findAddressFieldFor(self, fieldName):
 		descriptor = '&%s' % fieldName
@@ -539,48 +551,30 @@ class Structure:
 			if field[1][-l:] == descriptor:
 				return field[0]
 		return None
-		
-	def zeroValue(self, format):
-		two = format.split('*')
-		if len(two) == 2:
-			if two[0].isdigit():
-				return (self.zeroValue(two[1]),)*int(two[0])
-						
-		if not format.find('*') == -1: return ()
-		if 's' in format: return ''
-		if format in ['z',':','u']: return ''
-		if format == 'w': return '\x00\x00'
-
-		return 0
-
-	def clear(self):
-		for field in self.commonHdr + self.structure:
-			self[field[0]] = self.zeroValue(field[1])
 
 	def dump(self, msg = None, indent = 0):
-		import types
 		if msg is None: msg = self.__class__.__name__
 		ind = ' '*indent
-		print "\n%s" % (msg)
+		print("\n%s" % (msg,))
 		fixedFields = []
 		for field in self.commonHdr+self.structure:
 			i = field[0] 
 			if i in self.fields:
 				fixedFields.append(i)
-				if isinstance(self[i], Structure):
+				if hasattr(self[i], 'dump'):
 					self[i].dump('%s%s:{' % (ind,i), indent = indent + 4)
-					print "%s}" % ind
+					print("%s}" % ind)
 				else:
-					print "%s%s: {%r}" % (ind,i,self[i])
+					print("%s%s: {%r}" % (ind,i,self[i]))
 		# Do we have remaining fields not defined in the structures? let's 
 		# print them
 		remainingFields = list(set(self.fields) - set(fixedFields))
 		for i in remainingFields:
-			if isinstance(self[i], Structure):
+			if hasattr(self[i], 'dump'):
 				self[i].dump('%s%s:{' % (ind,i), indent = indent + 4)
-				print "%s}" % ind
+				print("%s}" % ind)
 			else:
-				print "%s%s: {%r}" % (ind,i,self[i])
+				print("%s%s: {%r}" % (ind,i,self[i]))
 
 
 class _StructureTest:
@@ -592,23 +586,23 @@ class _StructureTest:
 			return self.theClass(alignment = self.alignment)
 
 	def run(self):
-		print
-		print "-"*70
+		print()
+		print("-"*70)
 		testName = self.__class__.__name__
-		print "starting test: %s....." % testName
+		print("starting test: %s....." % testName)
 		a = self.create()
 		self.populate(a)
 		a.dump("packing.....")
-		a_str = str(a)
-		print "packed: %r" % a_str
-		print "unpacking....."
+		a_str = bytes(a)
+		print("packed: %r" % a_str)
+		print("unpacking.....")
 		b = self.create(a_str)
 		b.dump("unpacked.....")
-		print "repacking....."
-		b_str = str(b)
+		print("repacking.....")
+		b_str = bytes(b)
 		if b_str != a_str:
-			print "ERROR: original packed and repacked don't match"
-			print "packed: %r" % b_str
+			print("ERROR: original packed and repacked don't match")
+			print("packed: %r" % b_str)
 
 class _Test_simple(_StructureTest):
 	class theClass(Structure):
@@ -631,9 +625,9 @@ class _Test_simple(_StructureTest):
 		a['default'] = 'hola'
 		a['int1'] = 0x3131
 		a['int3'] = 0x45444342
-		a['z1']   = 'hola'
+		a['z1']   = b'hola'
 		a['u1']   = 'hola'.encode('utf_16_le')
-		a[':1']   = ':1234:'
+		a[':1']   = b':1234:'
 		a['arr1'] = (0x12341234,0x88990077,0x41414141)
 		# a['len1'] = 0x42424242
 
@@ -659,8 +653,8 @@ class _Test_nested(_StructureTest):
 	def populate(self, a):
 		a['nest1'] = _Test_nested.theClass._Inner()
 		a['nest2'] = _Test_nested.theClass._Inner()
-		a['nest1']['data'] = 'hola manola'
-		a['nest2']['data'] = 'chau loco'
+		a['nest1']['data'] = b'hola manola'
+		a['nest2']['data'] = b'chau loco'
 		a['int'] = 0x12345678
 	
 class _Test_Optional(_StructureTest):
@@ -692,20 +686,20 @@ class _Test_AsciiZArray(_StructureTest):
 	def populate(self, a):
 		a['head'] = 0x1234
 		a['tail'] = 0xabcd
-		a['array'] = ('hola','manola','te traje')
+		a['array'] = (b'hola',b'manola',b'te traje')
 		
 class _Test_UnpackCode(_StructureTest):
 	class theClass(Structure):
 		structure = (
 			('leni','<L=len(uno)*2'),
-			('cuchi','_-uno','leni/2'),
+			('cuchi','_-uno','leni//2'),
 			('uno',':'),
 			('dos',':'),
 		)
 
 	def populate(self, a):
-		a['uno'] = 'soy un loco!'
-		a['dos'] = 'que haces fiera'
+		a['uno'] = b'soy un loco!'
+		a['dos'] = b'que haces fiera'
 
 class _Test_AAA(_StructureTest):
 	class theClass(Structure):
@@ -725,7 +719,7 @@ class _Test_AAA(_StructureTest):
 		#a['pad']=int('01010101',2)
 		a['pad']=int('010101',2)
 		a['keyid']=0x07
-		a['data']="\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9"
+		a['data']=b"\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9"
 		a['icv'] = 0x05060708
 		#a['iv'] = 0x01020304
 		
@@ -735,7 +729,7 @@ if __name__ == '__main__':
 	try:
 		_Test_fixedLength().run()
 	except:
-		print "cannot repack because length is bogus"
+		print("cannot repack because length is bogus")
 
 	_Test_simple_aligned4().run()
 	_Test_nested().run()

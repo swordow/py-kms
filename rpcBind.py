@@ -1,9 +1,11 @@
 import binascii
 import rpcBase
-import struct
-import uuid
+try:
+	import uuid
+except ImportError:
+	import upy.uuid as uuid
 
-from dcerpc import MSRPCHeader, MSRPCBindAck
+from dcerpc import MSRPCHeader, MSRPCBindAck, MSRPC_BINDACK, MSRPC_BIND, MSRPC_ALTERCTX, MSRPC_ALTERCTX_R
 from structure import Structure
 
 uuidNDR32 = uuid.UUID('8a885d04-1ceb-11c9-9fe8-08002b104860')
@@ -16,9 +18,9 @@ class CtxItem(Structure):
 		('ContextID',          '<H=0'),
 		('TransItems',         'B=0'),
 		('Pad',                'B=0'),
-		('AbstractSyntaxUUID', '16s=""'),
+		('AbstractSyntaxUUID', '16s=b""'),
 		('AbstractSyntaxVer',  '<I=0'),
-		('TransferSyntaxUUID', '16s=""'),
+		('TransferSyntaxUUID', '16s=b""'),
 		('TransferSyntaxVer',  '<I=0'),
 	)
 
@@ -29,7 +31,7 @@ class CtxItemResult(Structure):
 	structure = (
 		('Result',             '<H=0'),
 		('Reason',             '<H=0'),
-		('TransferSyntaxUUID', '16s=""'),
+		('TransferSyntaxUUID', '16s=b""'),
 		('TransferSyntaxVer',  '<I=0'),
 	)
 
@@ -40,20 +42,42 @@ class CtxItemResult(Structure):
 		self['TransferSyntaxUUID'] = tsUUID.bytes_le
 		self['TransferSyntaxVer'] = tsVer
 
+class CtxItemArray:
+	def __init__(self, data):
+		self.data = data
+
+	def __len__(self):
+		return len(self.data)
+
+	def __bytes__(self):
+		return self.data
+
+	def __str__(self):
+		"""
+		In python 2, func `bytes` is alias of `str` and redirect to `__str__`,
+		workaround here is to redirect back to `__bytes__`
+		"""
+		if str is bytes:
+			return self.__bytes__()
+		else:
+			return super(CtxItemArray, self).__str__()
+
+	def dump(self, msg=None, indent=0):
+		if msg is None: msg = self.__class__.__name__
+		ind = ' '*indent
+		print("\n%s" % (msg,))
+		item_cnt = int( (len(self) + len(CtxItem()) - 1) / len(CtxItem()) )  # ceiling
+		for i in range(item_cnt):
+			if hasattr(self[i], 'dump'):
+				self[i].dump('%s%s:{' % (ind,i), indent = indent + 4)
+				print("%s}" % ind)
+			else:
+				print("%s%s: {%r}" % (ind,i,self[i]))
+
+	def __getitem__(self, i):
+		return CtxItem(self.data[(len(CtxItem()) * i):])
+
 class MSRPCBind(Structure):
-	class CtxItemArray:
-		def __init__(self, data):
-			self.data = data
-
-		def __len__(self):
-			return len(self.data)
-
-		def __str__(self):
-			return self.data
-
-		def __getitem__(self, i):
-			return CtxItem(self.data[(len(CtxItem()) * i):])
-
 	_CTX_ITEM_LEN = len(CtxItem())
 
 	structure = (
@@ -72,22 +96,26 @@ class handler(rpcBase.rpcBase):
 		request = MSRPCHeader(self.data)
 
 		if self.config['debug']:
-			print "RPC Bind Request Bytes:", binascii.b2a_hex(self.data)
-			print "RPC Bind Request:", request.dump(), MSRPCBind(request['pduData']).dump()
+			print("RPC Bind Request Bytes:", binascii.b2a_hex(self.data))
+			print("RPC Bind Request:", request.dump(), MSRPCBind(request['pduData']).dump())
 
 		return request
 
-	def generateResponse(self):
+	def generateResponse(self, request):
 		response = MSRPCBindAck()
-		request = self.requestData
 		bind = MSRPCBind(request['pduData'])
 
 		response['ver_major'] = request['ver_major']
 		response['ver_minor'] = request['ver_minor']
-		response['type'] = self.packetType['bindAck']
-		response['flags'] = self.packetFlags['firstFrag'] | self.packetFlags['lastFrag'] | self.packetFlags['multiplex']
+		response['flags'] = self.packetFlags['firstFrag'] | self.packetFlags['lastFrag']
+		if request['type'] == MSRPC_BIND:
+			response['type'] = MSRPC_BINDACK
+			response['flags'] |= request['flags'] & self.packetFlags['multiplex']
+		elif request['type'] == MSRPC_ALTERCTX:
+			response['type'] = MSRPC_ALTERCTX_R
+		else:
+			raise TypeError('Unknown RPC request type for bind like handler: %s' % response['type'])
 		response['representation'] = request['representation']
-		response['frag_len'] = 36 + bind['ctx_num'] * 24
 		response['auth_len'] = request['auth_len']
 		response['call_id'] = request['call_id']
 
@@ -95,31 +123,45 @@ class handler(rpcBase.rpcBase):
 		response['max_rfrag'] = bind['max_rfrag']
 		response['assoc_group'] = 0x1063bf3f
 
-		port = str(self.config['port'])
-		response['SecondaryAddrLen'] = len(port) + 1
-		response['SecondaryAddr'] = port
-		pad = (4-((response["SecondaryAddrLen"]+MSRPCBindAck._SIZE) % 4))%4
-		response['Pad'] = '\0' * pad
+		port = str(self.config['port']).encode()
+		if request['type'] == MSRPC_BIND:
+			response['SecondaryAddrLen'] = len(port) + 1
+			response['SecondaryAddr'] = port
+			response['frag_len'] = 36 + bind['ctx_num'] * 24
+		elif request['type'] == MSRPC_ALTERCTX:
+			response['SecondaryAddrLen'] = 0
+			response['frag_len'] = 32 + bind['ctx_num'] * 24
+		else:
+			raise TypeError('Unknown RPC request type for bind like handler: %s' % response['type'])
 		response['ctx_num'] = bind['ctx_num']
 
 		preparedResponses = {}
-		preparedResponses[uuidNDR32] = CtxItemResult(0, 0, uuidNDR32, 2)
-		preparedResponses[uuidNDR64] = CtxItemResult(2, 2, uuidEmpty, 0)
-		preparedResponses[uuidTime] = CtxItemResult(3, 3, uuidEmpty, 0)
+		if request['type'] == MSRPC_BIND:
+			if uuidNDR64 in [bind['ctx_items'][i].ts() for i in range(bind['ctx_num'])]:
+				preparedResponses[uuidNDR32] = CtxItemResult(2, 2, uuidEmpty, 0)
+				preparedResponses[uuidNDR64] = CtxItemResult(0, 0, uuidNDR64, 1)
+				preparedResponses[uuidTime] = CtxItemResult(3, 3, uuidEmpty, 0)
+			else:
+				preparedResponses[uuidNDR32] = CtxItemResult(0, 0, uuidNDR32, 2)
+				preparedResponses[uuidNDR64] = CtxItemResult(2, 2, uuidEmpty, 0)
+				preparedResponses[uuidTime] = CtxItemResult(3, 3, uuidEmpty, 0)
+		elif request['type'] == MSRPC_ALTERCTX:
+			preparedResponses[uuidNDR32] = CtxItemResult(0, 0, uuidNDR32, 2)
+		else:
+			raise TypeError('Unknown RPC request type for bind like handler: %s' % response['type'])
 
-		response['ctx_items'] = ''
+		response['ctx_items'] = b''
 		for i in range (0, bind['ctx_num']):
 			ts_uuid = bind['ctx_items'][i].ts()
 			resp = preparedResponses[ts_uuid]
-			response['ctx_items'] += str(resp)
+			response['ctx_items'] += resp.__bytes__()
 
 		if self.config['debug']:
-			print "RPC Bind Response:", response.dump()
-			print "RPC Bind Response Bytes:", binascii.b2a_hex(str(response))
+			print("RPC Bind Response:", response.dump())
+			print("RPC Bind Response Bytes:", binascii.b2a_hex(response.__bytes__()))
 
 		return response
 
-class bind(rpcBase.rpcBase):
 	def generateRequest(self):
 		firstCtxItem = CtxItem()
 		firstCtxItem['ContextID'] = 0
@@ -144,19 +186,19 @@ class bind(rpcBase.rpcBase):
 		bind['max_rfrag'] = 5840
 		bind['assoc_group'] = 0
 		bind['ctx_num'] = 2
-		bind['ctx_items'] = bind.CtxItemArray(str(firstCtxItem)+str(secondCtxItem))
+		bind['ctx_items'] = CtxItemArray(bytes(firstCtxItem)+bytes(secondCtxItem))
 
 		request = MSRPCHeader()
 		request['ver_major'] = 5
 		request['ver_minor'] = 0
-		request['type'] = self.packetType['bindReq']
+		request['type'] = MSRPC_BIND
 		request['flags'] = self.packetFlags['firstFrag'] | self.packetFlags['lastFrag'] | self.packetFlags['multiplex']
 		request['call_id'] = self.config['call_id']
-		request['pduData'] = str(bind)
+		request['pduData'] = bytes(bind)
 
 		if self.config['debug']:
-			print "RPC Bind Request:", request.dump(), MSRPCBind(request['pduData']).dump()
-			print "RPC Bind Request Bytes:", binascii.b2a_hex(str(request))
+			print("RPC Bind Request:", request.dump(), MSRPCBind(request['pduData']).dump())
+			print("RPC Bind Request Bytes:", binascii.b2a_hex(bytes(request)))
 
 		return request
 
